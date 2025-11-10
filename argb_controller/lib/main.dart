@@ -1,0 +1,547 @@
+import 'dart:async';
+import 'dart:math';
+import 'dart:typed_data';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_libserialport/flutter_libserialport.dart';
+import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:tray_manager/tray_manager.dart';
+import 'package:window_manager/window_manager.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await windowManager.ensureInitialized();
+  windowManager.setPreventClose(true);
+
+  const windowOptions = WindowOptions(
+    size: Size(950, 720),
+    center: true,
+    title: 'Windows LED Controller',
+  );
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
+
+  runApp(const ArgbApp());
+}
+
+class ArgbApp extends StatelessWidget {
+  const ArgbApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Windows LED Controller',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0F172A),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.cyanAccent),
+      ),
+      home: const ArgbHomePage(),
+    );
+  }
+}
+
+enum EffectMode {
+  staticColor,
+  breathing,
+  rainbow,
+  flash,
+  twoColor,
+  warmFlicker,
+}
+
+class ArgbHomePage extends StatefulWidget {
+  const ArgbHomePage({super.key});
+
+  @override
+  State<ArgbHomePage> createState() => _ArgbHomePageState();
+}
+
+class _ArgbHomePageState extends State<ArgbHomePage>
+    with TrayListener, WindowListener {
+  SerialPort? _port;
+  String? _selectedPort;
+
+  Color _currentColor = Colors.blue;
+  Color _secondaryColor = Colors.purple;
+  double _brightness = 70;
+  final double _maxPercent = 70;
+  EffectMode _mode = EffectMode.staticColor;
+  double _effectSpeed = 1.0;
+
+  Timer? _effectTimer;
+  double _t = 0;
+  final _rnd = Random();
+
+  // SETTINGS BÖLÜMÜ: 3 saniye sonra kaydetmek için
+  Timer? _saveDebounce;
+
+  @override
+  void initState() {
+    super.initState();
+    trayManager.addListener(this);
+    windowManager.addListener(this);
+    _initTray();
+
+    // önce ayarları yükle, sonra portu ve animasyonu başlat
+    _loadSettings().then((_) {
+      _autoSelectPort();
+      _startEffectLoop();
+    });
+  }
+
+  Future<void> _initTray() async {
+    // Windows için .ico, diğerleri için .png kullanabilirsin
+    await trayManager.setIcon('assets/tray_icon.ico');
+
+    await trayManager.setContextMenu(
+      Menu(
+        items: [
+          MenuItem(key: 'show', label: 'Göster'),
+          MenuItem.separator(),
+          MenuItem(key: 'exit', label: 'Programdan Çık'),
+        ],
+      ),
+    );
+  }
+
+  // tray icon click
+  @override
+  void onTrayIconMouseDown() async {
+    final isVisible = await windowManager.isVisible();
+    if (isVisible) {
+      await windowManager.hide();
+    } else {
+      await windowManager.show();
+      await windowManager.focus();
+    }
+  }
+
+  // SAĞ tık → menüyü aç
+  @override
+  void onTrayIconRightMouseUp() async {
+    await trayManager.popUpContextMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) async {
+    switch (menuItem.key) {
+      case 'show':
+        await windowManager.show();
+        await windowManager.focus();
+        break;
+      case 'exit':
+        await trayManager.destroy();
+        windowManager.setPreventClose(false);
+        await windowManager.close();
+        break;
+    }
+  }
+
+  // SETTINGS BÖLÜMÜ: ayarları yükle
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final json = prefs.getString('led_settings');
+    if (json == null) return;
+    try {
+      final map = Map<String, dynamic>.from(
+          // ignore: deprecated_member_use
+          (await SharedPreferences.getInstance()).getString('led_settings') !=
+                  null
+              ? Map<String, dynamic>.from(
+                  // dart:convert yoksa ekleyelim
+                  // ama biz basit parse yapacağız:
+                  // burada güvenli gidelim
+                  // aslında buraya hiç gelmeyeceğiz, aşağıda gerçek decode var
+                  {})
+              : {});
+    } catch (_) {
+      // eski format vs. hatayı yut
+    }
+
+    // daha düzgün: jsonDecode kullan
+    try {
+      final data = jsonDecode(json) as Map<String, dynamic>;
+      setState(() {
+        _brightness = (data['brightness'] ?? 70).toDouble();
+        _effectSpeed = (data['effectSpeed'] ?? 1.0).toDouble();
+        _selectedPort = data['port'] as String?;
+        _mode = EffectMode.values[data['mode'] ?? 0];
+        _currentColor = _colorFromHex(data['currentColor'] as String?);
+        _secondaryColor = _colorFromHex(data['secondaryColor'] as String?);
+      });
+    } catch (_) {
+      // bozuksa boşver
+    }
+  }
+
+  // SETTINGS BÖLÜMÜ: ayarları kaydet (3sn sonra)
+  void _scheduleSaveSettings() {
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(seconds: 3), _saveSettings);
+  }
+
+  Future<void> _saveSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final data = {
+      'brightness': _brightness,
+      'effectSpeed': _effectSpeed,
+      'port': _selectedPort,
+      'mode': _mode.index,
+      'currentColor': _colorToHex(_currentColor),
+      'secondaryColor': _colorToHex(_secondaryColor),
+    };
+    await prefs.setString('led_settings', jsonEncode(data));
+  }
+
+  String _colorToHex(Color c) =>
+      '#${c.alpha.toRadixString(16).padLeft(2, '0')}${c.red.toRadixString(16).padLeft(2, '0')}${c.green.toRadixString(16).padLeft(2, '0')}${c.blue.toRadixString(16).padLeft(2, '0')}';
+
+  Color _colorFromHex(String? s) {
+    if (s == null) return Colors.blue;
+    final buffer = StringBuffer();
+    if (s.length == 7) {
+      buffer.write('ff'); // alpha
+      buffer.write(s.replaceFirst('#', ''));
+    } else {
+      buffer.write(s.replaceFirst('#', ''));
+    }
+    return Color(int.parse(buffer.toString(), radix: 16));
+  }
+
+  @override
+  void dispose() {
+    trayManager.removeListener(this);
+    windowManager.removeListener(this);
+    _saveDebounce?.cancel();
+    _effectTimer?.cancel();
+    _port?.close();
+    super.dispose();
+  }
+
+  // çarpı -> gizle
+  @override
+  Future<void> onWindowClose() async {
+    await windowManager.hide();
+  }
+
+  void _startEffectLoop() {
+    _effectTimer =
+        Timer.periodic(const Duration(milliseconds: 33), (_) => _tickEffect());
+  }
+
+  void _tickEffect() {
+    Color toSend;
+    final speed = _effectSpeed.clamp(0.1, 3.0);
+
+    switch (_mode) {
+      case EffectMode.staticColor:
+        toSend = _currentColor;
+        break;
+      case EffectMode.breathing:
+        _t += 0.03 * speed;
+        final s = (sin(_t) + 1) / 2;
+        final factor = 0.25 + s * 0.75;
+        toSend = _scaleColor(_currentColor, factor);
+        break;
+      case EffectMode.rainbow:
+        _t += 0.01 * speed;
+        final hue = (_t % 1.0);
+        toSend = HSVColor.fromAHSV(1, hue * 360, 1, 1).toColor();
+        break;
+      case EffectMode.flash:
+        _t += 0.05 * speed;
+        final on = sin(_t) > 0;
+        toSend = on ? _currentColor : Colors.black;
+        break;
+      case EffectMode.twoColor:
+        _t += 0.015 * speed;
+        final s2 = (sin(_t) + 1) / 2;
+        toSend = Color.lerp(_currentColor, _secondaryColor, s2) ?? _currentColor;
+        break;
+      case EffectMode.warmFlicker:
+        _t += 0.02 * speed;
+        final base = const Color(0xFFFFA000);
+        final jitter = 0.85 + _rnd.nextDouble() * 0.15;
+        toSend = _scaleColor(base, jitter);
+        break;
+    }
+
+    _sendColor(toSend);
+  }
+
+  Color _scaleColor(Color c, double f) {
+    return Color.fromARGB(
+      c.alpha,
+      (c.red * f).clamp(0, 255).round(),
+      (c.green * f).clamp(0, 255).round(),
+      (c.blue * f).clamp(0, 255).round(),
+    );
+  }
+
+  void _autoSelectPort() {
+    final ports = SerialPort.availablePorts;
+    String? found;
+    for (final p in ports) {
+      if (p.toUpperCase().contains('COM15')) {
+        found = p;
+        break;
+      }
+    }
+    found ??= ports.isNotEmpty ? ports.first : null;
+    if (found != null) {
+      _openPort(found);
+    }
+  }
+
+  bool _openPort(String portName) {
+    try {
+      _port?.close();
+    } catch (_) {}
+    final port = SerialPort(portName);
+    if (!port.openReadWrite()) {
+      debugPrint('Port açılamadı: $portName');
+      return false;
+    }
+
+    final cfg = SerialPortConfig()
+      ..baudRate = 115200
+      ..bits = 8
+      ..stopBits = 1
+      ..parity = SerialPortParity.none;
+    port.config = cfg;
+
+    setState(() {
+      _port = port;
+      _selectedPort = portName;
+    });
+
+    // ayar değişti -> kaydet
+    _scheduleSaveSettings();
+    return true;
+  }
+
+  void _sendColor(Color color) {
+    final port = _port;
+    if (port == null || !port.isOpen) return;
+
+    final clamped = _brightness.clamp(0, _maxPercent);
+    final scale = clamped / 100.0;
+    final r = (color.red * scale).round();
+    final g = (color.green * scale).round();
+    final b = (color.blue * scale).round();
+
+    final cmd = 'S $r $g $b\n';
+    final data = Uint8List.fromList(cmd.codeUnits);
+
+    try {
+      port.write(data);
+    } catch (e) {
+      debugPrint('Yazma hatası: $e');
+    }
+  }
+
+  void _openColorPicker({bool secondary = false}) {
+    Color tempColor = secondary ? _secondaryColor : _currentColor;
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E293B),
+          title: Text(secondary ? 'İkincil renk seç' : 'Renk seç'),
+          content: SingleChildScrollView(
+            child: ColorPicker(
+              pickerColor: tempColor,
+              onColorChanged: (c) => tempColor = c,
+              enableAlpha: false,
+              labelTypes: const [],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Vazgeç'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                setState(() {
+                  if (secondary) {
+                    _secondaryColor = tempColor;
+                  } else {
+                    _currentColor = tempColor;
+                  }
+                });
+                if (!secondary && _mode == EffectMode.staticColor) {
+                  _sendColor(tempColor);
+                }
+                _scheduleSaveSettings();
+                Navigator.of(ctx).pop();
+              },
+              child: const Text('Uygula'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ports = SerialPort.availablePorts;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Windows LED Controller'),
+        backgroundColor: Colors.black.withOpacity(0.3),
+        elevation: 0,
+        actions: [
+          TextButton.icon(
+            onPressed: () => _openColorPicker(),
+            icon: const Icon(Icons.palette, color: Colors.white),
+            label: const Text('Renk', style: TextStyle(color: Colors.white)),
+          ),
+          TextButton.icon(
+            onPressed: () => _openColorPicker(secondary: true),
+            icon: const Icon(Icons.color_lens, color: Colors.white),
+            label: const Text('İkincil', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                const Text('Port:', style: TextStyle(fontSize: 16)),
+                const SizedBox(width: 12),
+                DropdownButton<String>(
+                  value: _selectedPort,
+                  hint: const Text('Port seç'),
+                  dropdownColor: const Color(0xFF1E293B),
+                  items: ports.map((p) {
+                    return DropdownMenuItem(value: p, child: Text(p));
+                  }).toList(),
+                  onChanged: (val) {
+                    if (val != null) {
+                      final ok = _openPort(val);
+                      if (ok && _mode == EffectMode.staticColor) {
+                        _sendColor(_currentColor);
+                      }
+                    }
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _modeButton('Statik', EffectMode.staticColor),
+                _modeButton('Nefes', EffectMode.breathing),
+                _modeButton('Rainbow', EffectMode.rainbow),
+                _modeButton('Flash', EffectMode.flash),
+                _modeButton('2 Renk', EffectMode.twoColor),
+                _modeButton('Warm', EffectMode.warmFlicker),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Parlaklık: ${_brightness.toStringAsFixed(0)}% (maks: ${_maxPercent.toStringAsFixed(0)}%)',
+                  style: const TextStyle(fontSize: 14),
+                ),
+                Slider(
+                  value: _brightness,
+                  min: 0,
+                  max: 100,
+                  divisions: 100,
+                  label: _brightness.toStringAsFixed(0),
+                  onChanged: (val) {
+                    setState(() {
+                      _brightness = val;
+                    });
+                    if (_mode == EffectMode.staticColor) {
+                      _sendColor(_currentColor);
+                    }
+                    _scheduleSaveSettings();
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Efekt hızı: ${_effectSpeed.toStringAsFixed(2)}x',
+                  style: const TextStyle(fontSize: 14),
+                ),
+                Slider(
+                  value: _effectSpeed,
+                  min: 0.1,
+                  max: 3.0,
+                  divisions: 29,
+                  label: _effectSpeed.toStringAsFixed(2),
+                  onChanged: (val) {
+                    setState(() {
+                      _effectSpeed = val;
+                    });
+                    _scheduleSaveSettings();
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Container(
+              height: 110,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    _currentColor.withOpacity(0.1),
+                    _currentColor,
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Center(
+                child: Text(
+                  _mode.name.toUpperCase(),
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _modeButton(String label, EffectMode mode) {
+    final selected = _mode == mode;
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: selected ? Colors.cyan : const Color(0xFF1E293B),
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+      onPressed: () {
+        setState(() {
+          _mode = mode;
+        });
+        _scheduleSaveSettings();
+      },
+      child: Text(label),
+    );
+  }
+}
