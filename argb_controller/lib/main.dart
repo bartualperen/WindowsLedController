@@ -50,7 +50,7 @@ enum EffectMode {
   staticColor,
   breathing,
   rainbow,
-  flash,
+  circularTwoColor, // eski flash yerine
   twoColor,
   warmFlicker,
 }
@@ -66,6 +66,11 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     with TrayListener, WindowListener {
   SerialPort? _port;
   String? _selectedPort;
+
+  // circular modda aynı şeyi tekrar tekrar göndermemek için
+  Color? _lastDualC1;
+  Color? _lastDualC2;
+  int? _lastDualSpeedMs;
 
   Color _currentColor = Colors.blue;
   Color _secondaryColor = Colors.purple;
@@ -174,6 +179,42 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     }
   }
 
+  void _sendDualColor(Color c1, Color c2) {
+    final port = _port;
+    if (port == null || !port.isOpen) return;
+
+    final clamped = _brightness.clamp(0, _maxPercent);
+    final scale = clamped / 100.0;
+
+    final r1 = (c1.red * scale).round();
+    final g1 = (c1.green * scale).round();
+    final b1 = (c1.blue * scale).round();
+
+    final r2 = (c2.red * scale).round();
+    final g2 = (c2.green * scale).round();
+    final b2 = (c2.blue * scale).round();
+
+    final speedMs = _mapSpeedToMs(_effectSpeed);
+
+    // değişmediyse hiç yollama
+    if (_lastDualC1 == c1 &&
+        _lastDualC2 == c2 &&
+        _lastDualSpeedMs == speedMs) {
+      return;
+    }
+
+    final cmd = 'D $r1 $g1 $b1 $r2 $g2 $b2 $speedMs\n';
+    final data = Uint8List.fromList(cmd.codeUnits);
+    try {
+      port.write(data);
+      _lastDualC1 = c1;
+      _lastDualC2 = c2;
+      _lastDualSpeedMs = speedMs;
+    } catch (e) {
+      debugPrint('Yazma hatası: $e');
+    }
+  }
+
   void _scheduleSaveSettings() {
     _saveDebounce?.cancel();
     _saveDebounce = Timer(const Duration(seconds: 3), _saveSettings);
@@ -218,6 +259,19 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     super.dispose();
   }
 
+  int _mapSpeedToMs(double s) {
+    // s: 0.1 .. 3.0
+    // ms: 200 .. 30 (ters orantı)
+    const minMs = 30;
+    const maxMs = 200;
+    final clamped = s.clamp(0.1, 3.0);
+    // 0.1 -> 1.0, 3.0 -> 0.0 gibi bir ters normalize
+    final t = (clamped - 0.1) / (3.0 - 0.1); // 0..1
+    final inverted = 1.0 - t; // 1..0
+    final ms = maxMs * inverted + minMs * (1 - inverted);
+    return ms.round();
+  }
+
   // pencere kapatılınca gizle
   @override
   Future<void> onWindowClose() async {
@@ -243,27 +297,30 @@ class _ArgbHomePageState extends State<ArgbHomePage>
       case EffectMode.staticColor:
         toSend = _currentColor;
         break;
+
       case EffectMode.breathing:
         _t += 0.03 * speed;
         final s = (sin(_t) + 1) / 2;
         final factor = 0.25 + s * 0.75;
         toSend = _scaleColor(_currentColor, factor);
         break;
+
       case EffectMode.rainbow:
         _t += 0.01 * speed;
         final hue = (_t % 1.0);
         toSend = HSVColor.fromAHSV(1, hue * 360, 1, 1).toColor();
         break;
-      case EffectMode.flash:
-        _t += 0.05 * speed;
-        final on = sin(_t) > 0;
-        toSend = on ? _currentColor : Colors.black;
-        break;
+
+      case EffectMode.circularTwoColor:
+        // Arduino kendi döndürüyor, burada seri spam yok
+        return;
+
       case EffectMode.twoColor:
         _t += 0.015 * speed;
         final s2 = (sin(_t) + 1) / 2;
         toSend = Color.lerp(_currentColor, _secondaryColor, s2) ?? _currentColor;
         break;
+
       case EffectMode.warmFlicker:
         _t += 0.02 * speed;
         final base = const Color(0xFFFF3402);
@@ -375,7 +432,11 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                     _currentColor = tempColor;
                   }
                 });
-                if (!secondary && _mode == EffectMode.staticColor) {
+                // circular moddaysak değişikliği gönder
+                if (_mode == EffectMode.circularTwoColor) {
+                  _sendDualColor(_currentColor, _secondaryColor);
+                } else if (!secondary && _mode == EffectMode.staticColor) {
+                  // statik modda ana renk değiştiyse hemen gönder
                   _sendColor(tempColor);
                 }
                 _scheduleSaveSettings();
@@ -476,7 +537,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                     _modeButton('Statik', EffectMode.staticColor),
                     _modeButton('Nefes', EffectMode.breathing),
                     _modeButton('Rainbow', EffectMode.rainbow),
-                    _modeButton('Flash', EffectMode.flash),
+                    _modeButton('Dairesel 2', EffectMode.circularTwoColor),
                     _modeButton('2 Renk', EffectMode.twoColor),
                     _modeButton('Warm', EffectMode.warmFlicker),
                   ],
@@ -501,6 +562,8 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                         });
                         if (_mode == EffectMode.staticColor) {
                           _sendColor(_currentColor);
+                        } else if (_mode == EffectMode.circularTwoColor) {
+                          _sendDualColor(_currentColor, _secondaryColor);
                         }
                         _scheduleSaveSettings();
                       },
@@ -525,6 +588,9 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                         setState(() {
                           _effectSpeed = val;
                         });
+                        if (_mode == EffectMode.circularTwoColor) {
+                          _sendDualColor(_currentColor, _secondaryColor);
+                        }
                         _scheduleSaveSettings();
                       },
                     ),
@@ -597,6 +663,9 @@ class _ArgbHomePageState extends State<ArgbHomePage>
         setState(() {
           _mode = mode;
         });
+        if (mode == EffectMode.circularTwoColor) {
+          _sendDualColor(_currentColor, _secondaryColor);
+        }
         _scheduleSaveSettings();
       },
       child: Text(label),
