@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io'; // RAM ölçmek için
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:convert';
@@ -77,8 +78,12 @@ class _ArgbHomePageState extends State<ArgbHomePage>
   double _t = 0;
   final _rnd = Random();
 
-  // SETTINGS BÖLÜMÜ: 3 saniye sonra kaydetmek için
+  // ayar kaydetme
   Timer? _saveDebounce;
+
+  // hafif perf izleme
+  Timer? _perfTimer;
+  int _ramMb = 0;
 
   @override
   void initState() {
@@ -87,15 +92,21 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     windowManager.addListener(this);
     _initTray();
 
-    // önce ayarları yükle, sonra portu ve animasyonu başlat
     _loadSettings().then((_) {
       _autoSelectPort();
       _startEffectLoop();
     });
+
+    // RAM'i hafifçe izle
+    _perfTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final rss = ProcessInfo.currentRss; // bytes
+      setState(() {
+        _ramMb = (rss / (1024 * 1024)).round();
+      });
+    });
   }
 
   Future<void> _initTray() async {
-    // Windows için .ico, diğerleri için .png kullanabilirsin
     await trayManager.setIcon('assets/tray_icon.ico');
 
     await trayManager.setContextMenu(
@@ -109,7 +120,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     );
   }
 
-  // tray icon click
+  // tray icon sol tık
   @override
   void onTrayIconMouseDown() async {
     final isVisible = await windowManager.isVisible();
@@ -121,7 +132,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     }
   }
 
-  // SAĞ tık → menüyü aç
+  // tray icon sağ tık
   @override
   void onTrayIconRightMouseUp() async {
     await trayManager.popUpContextMenu();
@@ -142,28 +153,12 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     }
   }
 
-  // SETTINGS BÖLÜMÜ: ayarları yükle
+  // ayarları yükle
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final json = prefs.getString('led_settings');
     if (json == null) return;
-    try {
-      final map = Map<String, dynamic>.from(
-          // ignore: deprecated_member_use
-          (await SharedPreferences.getInstance()).getString('led_settings') !=
-                  null
-              ? Map<String, dynamic>.from(
-                  // dart:convert yoksa ekleyelim
-                  // ama biz basit parse yapacağız:
-                  // burada güvenli gidelim
-                  // aslında buraya hiç gelmeyeceğiz, aşağıda gerçek decode var
-                  {})
-              : {});
-    } catch (_) {
-      // eski format vs. hatayı yut
-    }
 
-    // daha düzgün: jsonDecode kullan
     try {
       final data = jsonDecode(json) as Map<String, dynamic>;
       setState(() {
@@ -179,7 +174,6 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     }
   }
 
-  // SETTINGS BÖLÜMÜ: ayarları kaydet (3sn sonra)
   void _scheduleSaveSettings() {
     _saveDebounce?.cancel();
     _saveDebounce = Timer(const Duration(seconds: 3), _saveSettings);
@@ -219,21 +213,22 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     windowManager.removeListener(this);
     _saveDebounce?.cancel();
     _effectTimer?.cancel();
+    _perfTimer?.cancel();
     _port?.close();
     super.dispose();
   }
 
-  // çarpı -> gizle
+  // pencere kapatılınca gizle
   @override
   Future<void> onWindowClose() async {
     await windowManager.hide();
   }
 
   Future<void> _exitApp() async {
-  await trayManager.destroy();          // tray'i temizle
-  windowManager.setPreventClose(false); // kapanmaya izin ver
-  await windowManager.close();          // pencereyi kapat
-}
+    await trayManager.destroy();
+    windowManager.setPreventClose(false);
+    await windowManager.close();
+  }
 
   void _startEffectLoop() {
     _effectTimer =
@@ -326,7 +321,6 @@ class _ArgbHomePageState extends State<ArgbHomePage>
       _selectedPort = portName;
     });
 
-    // ayar değişti -> kaydet
     _scheduleSaveSettings();
     return true;
   }
@@ -414,8 +408,8 @@ class _ArgbHomePageState extends State<ArgbHomePage>
         actions: [
           TextButton.icon(
             style: TextButton.styleFrom(
-              foregroundColor: Colors.white,            // ikon + yazı
-              backgroundColor: Colors.white24,           // biraz şeffaf arka plan
+              foregroundColor: Colors.white,
+              backgroundColor: Colors.white24,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(8),
               ),
@@ -446,118 +440,147 @@ class _ArgbHomePageState extends State<ArgbHomePage>
           const SizedBox(width: 8),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Row(
+      body: Stack(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
               children: [
-                const Text('Port:', style: TextStyle(fontSize: 16)),
-                const SizedBox(width: 12),
-                DropdownButton<String>(
-                  value: _selectedPort,
-                  hint: const Text('Port seç'),
-                  dropdownColor: const Color(0xFF1E293B),
-                  items: ports.map((p) {
-                    return DropdownMenuItem(value: p, child: Text(p));
-                  }).toList(),
-                  onChanged: (val) {
-                    if (val != null) {
-                      final ok = _openPort(val);
-                      if (ok && _mode == EffectMode.staticColor) {
-                        _sendColor(_currentColor);
-                      }
-                    }
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _modeButton('Statik', EffectMode.staticColor),
-                _modeButton('Nefes', EffectMode.breathing),
-                _modeButton('Rainbow', EffectMode.rainbow),
-                _modeButton('Flash', EffectMode.flash),
-                _modeButton('2 Renk', EffectMode.twoColor),
-                _modeButton('Warm', EffectMode.warmFlicker),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Parlaklık: ${_brightness.toStringAsFixed(0)}% (maks: ${_maxPercent.toStringAsFixed(0)}%)',
-                  style: const TextStyle(fontSize: 14),
-                ),
-                Slider(
-                  value: _brightness,
-                  min: 0,
-                  max: 70,
-                  divisions: 100,
-                  label: _brightness.toStringAsFixed(0),
-                  onChanged: (val) {
-                    setState(() {
-                      _brightness = val;
-                    });
-                    if (_mode == EffectMode.staticColor) {
-                      _sendColor(_currentColor);
-                    }
-                    _scheduleSaveSettings();
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Efekt hızı: ${_effectSpeed.toStringAsFixed(2)}x',
-                  style: const TextStyle(fontSize: 14),
-                ),
-                Slider(
-                  value: _effectSpeed,
-                  min: 0.1,
-                  max: 3.0,
-                  divisions: 29,
-                  label: _effectSpeed.toStringAsFixed(2),
-                  onChanged: (val) {
-                    setState(() {
-                      _effectSpeed = val;
-                    });
-                    _scheduleSaveSettings();
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Container(
-              height: 110,
-              width: double.infinity,
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    _currentColor.withOpacity(0.1),
-                    _currentColor,
+                Row(
+                  children: [
+                    const Text('Port:', style: TextStyle(fontSize: 16)),
+                    const SizedBox(width: 12),
+                    DropdownButton<String>(
+                      value: _selectedPort,
+                      hint: const Text('Port seç'),
+                      dropdownColor: const Color(0xFF1E293B),
+                      items: ports.map((p) {
+                        return DropdownMenuItem(value: p, child: Text(p));
+                      }).toList(),
+                      onChanged: (val) {
+                        if (val != null) {
+                          final ok = _openPort(val);
+                          if (ok && _mode == EffectMode.staticColor) {
+                            _sendColor(_currentColor);
+                          }
+                        }
+                      },
+                    ),
                   ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
                 ),
-                borderRadius: BorderRadius.circular(16),
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _modeButton('Statik', EffectMode.staticColor),
+                    _modeButton('Nefes', EffectMode.breathing),
+                    _modeButton('Rainbow', EffectMode.rainbow),
+                    _modeButton('Flash', EffectMode.flash),
+                    _modeButton('2 Renk', EffectMode.twoColor),
+                    _modeButton('Warm', EffectMode.warmFlicker),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Parlaklık: ${_brightness.toStringAsFixed(0)}% (maks: ${_maxPercent.toStringAsFixed(0)}%)',
+                      style: const TextStyle(fontSize: 14),
+                    ),
+                    Slider(
+                      value: _brightness,
+                      min: 0,
+                      max: 70,
+                      divisions: 100,
+                      label: _brightness.toStringAsFixed(0),
+                      onChanged: (val) {
+                        setState(() {
+                          _brightness = val;
+                        });
+                        if (_mode == EffectMode.staticColor) {
+                          _sendColor(_currentColor);
+                        }
+                        _scheduleSaveSettings();
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Efekt hızı: ${_effectSpeed.toStringAsFixed(2)}x',
+                      style: const TextStyle(fontSize: 14),
+                    ),
+                    Slider(
+                      value: _effectSpeed,
+                      min: 0.1,
+                      max: 3.0,
+                      divisions: 29,
+                      label: _effectSpeed.toStringAsFixed(2),
+                      onChanged: (val) {
+                        setState(() {
+                          _effectSpeed = val;
+                        });
+                        _scheduleSaveSettings();
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  height: 110,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [
+                        _currentColor.withOpacity(0.1),
+                        _currentColor,
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Center(
+                    child: Text(
+                      _mode.name.toUpperCase(),
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // sol alt RAM göstergesi
+          Positioned(
+            left: 16,
+            bottom: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.35),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.cyanAccent.withOpacity(0.6)),
               ),
-              child: Center(
-                child: Text(
-                  _mode.name.toUpperCase(),
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.memory, size: 16, color: Colors.white70),
+                  const SizedBox(width: 6),
+                  Text(
+                    'RAM: $_ramMb MB',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
