@@ -229,6 +229,12 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     await windowManager.hide();
   }
 
+  Future<void> _exitApp() async {
+  await trayManager.destroy();          // tray'i temizle
+  windowManager.setPreventClose(false); // kapanmaya izin ver
+  await windowManager.close();          // pencereyi kapat
+}
+
   void _startEffectLoop() {
     _effectTimer =
         Timer.periodic(const Duration(milliseconds: 33), (_) => _tickEffect());
@@ -265,7 +271,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
         break;
       case EffectMode.warmFlicker:
         _t += 0.02 * speed;
-        final base = const Color(0xFFFFA000);
+        final base = const Color(0xFFFF3402);
         final jitter = 0.85 + _rnd.nextDouble() * 0.15;
         toSend = _scaleColor(base, jitter);
         break;
@@ -395,20 +401,49 @@ class _ArgbHomePageState extends State<ArgbHomePage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Windows LED Controller'),
-        backgroundColor: Colors.black.withOpacity(0.3),
+        title: const Text(
+          'ALPORA LED Controller',
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 18,
+          ),
+        ),
+        backgroundColor: Colors.black.withOpacity(0.4),
         elevation: 0,
         actions: [
           TextButton.icon(
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white,            // ikon + yazı
+              backgroundColor: Colors.white24,           // biraz şeffaf arka plan
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
             onPressed: () => _openColorPicker(),
-            icon: const Icon(Icons.palette, color: Colors.white),
-            label: const Text('Renk', style: TextStyle(color: Colors.white)),
+            icon: const Icon(Icons.palette),
+            label: const Text('Renk'),
           ),
+          const SizedBox(width: 8),
           TextButton.icon(
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white,
+              backgroundColor: Colors.white24,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
             onPressed: () => _openColorPicker(secondary: true),
-            icon: const Icon(Icons.color_lens, color: Colors.white),
-            label: const Text('İkincil', style: TextStyle(color: Colors.white)),
+            icon: const Icon(Icons.color_lens),
+            label: const Text('İkincil'),
           ),
+          const SizedBox(width: 8),
+          IconButton(
+            icon: const Icon(Icons.exit_to_app, color: Colors.white),
+            tooltip: 'Çıkış',
+            onPressed: _exitApp,
+          ),
+          const SizedBox(width: 8),
         ],
       ),
       body: Padding(
@@ -461,7 +496,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                 Slider(
                   value: _brightness,
                   min: 0,
-                  max: 100,
+                  max: 70,
                   divisions: 100,
                   label: _brightness.toStringAsFixed(0),
                   onChanged: (val) {
