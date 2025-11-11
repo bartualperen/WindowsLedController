@@ -13,6 +13,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Ayarı burada da okuyalım ki pencereyi hiç göstermeden gizleyebilelim
+  final prefs = await SharedPreferences.getInstance();
+  final startHidden = prefs.getBool('startHidden') ?? false;
+
   await windowManager.ensureInitialized();
   windowManager.setPreventClose(true);
 
@@ -22,15 +26,21 @@ Future<void> main() async {
     title: 'Windows LED Controller',
   );
   windowManager.waitUntilReadyToShow(windowOptions, () async {
-    await windowManager.show();
-    await windowManager.focus();
+    if (startHidden) {
+      // sadece tray'de kalsın
+      await windowManager.hide();
+    } else {
+      await windowManager.show();
+      await windowManager.focus();
+    }
   });
 
-  runApp(const ArgbApp());
+  runApp(ArgbApp(startHidden: startHidden));
 }
 
 class ArgbApp extends StatelessWidget {
-  const ArgbApp({super.key});
+  final bool startHidden;
+  const ArgbApp({super.key, required this.startHidden});
 
   @override
   Widget build(BuildContext context) {
@@ -41,7 +51,7 @@ class ArgbApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0F172A),
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.cyanAccent),
       ),
-      home: const ArgbHomePage(),
+      home: ArgbHomePage(startHidden: startHidden),
     );
   }
 }
@@ -56,7 +66,8 @@ enum EffectMode {
 }
 
 class ArgbHomePage extends StatefulWidget {
-  const ArgbHomePage({super.key});
+  final bool startHidden;
+  const ArgbHomePage({super.key, required this.startHidden});
 
   @override
   State<ArgbHomePage> createState() => _ArgbHomePageState();
@@ -67,7 +78,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
   SerialPort? _port;
   String? _selectedPort;
 
-  // circular modda aynı şeyi tekrar tekrar göndermemek için
+  // circular modda aynı şeyi tekrar tekrar göndermemek için (şimdi sadece değer tutacağız)
   Color? _lastDualC1;
   Color? _lastDualC2;
   int? _lastDualSpeedMs;
@@ -90,15 +101,25 @@ class _ArgbHomePageState extends State<ArgbHomePage>
   Timer? _perfTimer;
   int _ramMb = 0;
 
+  // yeni: arka planda başlat ayarı
+  bool _startHidden = false;
+
   @override
   void initState() {
     super.initState();
     trayManager.addListener(this);
     windowManager.addListener(this);
+
     _initTray();
+
+    // ilk değer main'den geldi
+    _startHidden = widget.startHidden;
 
     _loadSettings().then((_) {
       _autoSelectPort();
+      // port açılınca mod neyse onu gönder
+      _applyCurrentModeToDevice();
+
       _startEffectLoop();
     });
 
@@ -173,6 +194,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
         _mode = EffectMode.values[data['mode'] ?? 0];
         _currentColor = _colorFromHex(data['currentColor'] as String?);
         _secondaryColor = _colorFromHex(data['secondaryColor'] as String?);
+        _startHidden = (data['startHidden'] ?? _startHidden) as bool;
       });
     } catch (_) {
       // bozuksa boşver
@@ -196,17 +218,11 @@ class _ArgbHomePageState extends State<ArgbHomePage>
 
     final speedMs = _mapSpeedToMs(_effectSpeed);
 
-    // değişmediyse hiç yollama
-    if (_lastDualC1 == c1 &&
-        _lastDualC2 == c2 &&
-        _lastDualSpeedMs == speedMs) {
-      return;
-    }
-
     final cmd = 'D $r1 $g1 $b1 $r2 $g2 $b2 $speedMs\n';
     final data = Uint8List.fromList(cmd.codeUnits);
     try {
       port.write(data);
+      // sadece son gönderilenleri hatırla, artık gönderimi engellemiyoruz
       _lastDualC1 = c1;
       _lastDualC2 = c2;
       _lastDualSpeedMs = speedMs;
@@ -229,6 +245,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
       'mode': _mode.index,
       'currentColor': _colorToHex(_currentColor),
       'secondaryColor': _colorToHex(_secondaryColor),
+      'startHidden': _startHidden, // yeni ayar
     };
     await prefs.setString('led_settings', jsonEncode(data));
   }
@@ -265,7 +282,6 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     const minMs = 30;
     const maxMs = 200;
     final clamped = s.clamp(0.1, 3.0);
-    // 0.1 -> 1.0, 3.0 -> 0.0 gibi bir ters normalize
     final t = (clamped - 0.1) / (3.0 - 0.1); // 0..1
     final inverted = 1.0 - t; // 1..0
     final ms = maxMs * inverted + minMs * (1 - inverted);
@@ -318,7 +334,8 @@ class _ArgbHomePageState extends State<ArgbHomePage>
       case EffectMode.twoColor:
         _t += 0.015 * speed;
         final s2 = (sin(_t) + 1) / 2;
-        toSend = Color.lerp(_currentColor, _secondaryColor, s2) ?? _currentColor;
+        toSend =
+            Color.lerp(_currentColor, _secondaryColor, s2) ?? _currentColor;
         break;
 
       case EffectMode.warmFlicker:
@@ -344,6 +361,13 @@ class _ArgbHomePageState extends State<ArgbHomePage>
   void _autoSelectPort() {
     final ports = SerialPort.availablePorts;
     String? found;
+
+    // kaydedilmiş port varsa önce onu dene
+    if (_selectedPort != null && ports.contains(_selectedPort)) {
+      _openPort(_selectedPort!);
+      return;
+    }
+
     for (final p in ports) {
       if (p.toUpperCase().contains('COM15')) {
         found = p;
@@ -360,6 +384,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     try {
       _port?.close();
     } catch (_) {}
+
     final port = SerialPort(portName);
     if (!port.openReadWrite()) {
       debugPrint('Port açılamadı: $portName');
@@ -376,7 +401,15 @@ class _ArgbHomePageState extends State<ArgbHomePage>
     setState(() {
       _port = port;
       _selectedPort = portName;
+
+      // yeni port açıldığında circular cache’i sıfırla
+      _lastDualC1 = null;
+      _lastDualC2 = null;
+      _lastDualSpeedMs = null;
     });
+
+    // port açıldıysa şu anki modu cihaza uygula
+    _applyCurrentModeToDevice();
 
     _scheduleSaveSettings();
     return true;
@@ -436,7 +469,6 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                 if (_mode == EffectMode.circularTwoColor) {
                   _sendDualColor(_currentColor, _secondaryColor);
                 } else if (!secondary && _mode == EffectMode.staticColor) {
-                  // statik modda ana renk değiştiyse hemen gönder
                   _sendColor(tempColor);
                 }
                 _scheduleSaveSettings();
@@ -520,10 +552,7 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                       }).toList(),
                       onChanged: (val) {
                         if (val != null) {
-                          final ok = _openPort(val);
-                          if (ok && _mode == EffectMode.staticColor) {
-                            _sendColor(_currentColor);
-                          }
+                          _openPort(val);
                         }
                       },
                     ),
@@ -618,6 +647,30 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                     ),
                   ),
                 ),
+                const SizedBox(height: 16),
+                SwitchListTile(
+                  value: _startHidden,
+                  onChanged: (val) {
+                    setState(() {
+                      _startHidden = val;
+                    });
+                    _scheduleSaveSettings();
+                  },
+                  title: const Text(
+                    'Windows açılışında arka planda başlat',
+                    style: TextStyle(
+                      color: Colors.white, // başlık rengi
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  subtitle: const Text(
+                    'Pencereyi göstermeden tray\'de dursun',
+                    style: TextStyle(
+                      color: Colors.white70, // açıklama rengi (biraz soluk beyaz)
+                    ),
+                  ),
+                  contentPadding: EdgeInsets.zero,
+                ),
               ],
             ),
           ),
@@ -665,10 +718,31 @@ class _ArgbHomePageState extends State<ArgbHomePage>
         });
         if (mode == EffectMode.circularTwoColor) {
           _sendDualColor(_currentColor, _secondaryColor);
+        } else if (mode == EffectMode.staticColor) {
+          _sendColor(_currentColor);
         }
         _scheduleSaveSettings();
       },
       child: Text(label),
     );
+  }
+
+  void _applyCurrentModeToDevice() {
+    if (_port == null || !_port!.isOpen) return;
+
+    switch (_mode) {
+      case EffectMode.staticColor:
+        _sendColor(_currentColor);
+        break;
+      case EffectMode.circularTwoColor:
+        _sendDualColor(_currentColor, _secondaryColor);
+        break;
+      case EffectMode.twoColor:
+      case EffectMode.breathing:
+      case EffectMode.rainbow:
+      case EffectMode.warmFlicker:
+        _sendColor(_currentColor);
+        break;
+    }
   }
 }
