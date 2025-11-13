@@ -647,30 +647,30 @@ class _ArgbHomePageState extends State<ArgbHomePage>
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
-                SwitchListTile(
-                  value: _startHidden,
-                  onChanged: (val) {
-                    setState(() {
-                      _startHidden = val;
-                    });
-                    _scheduleSaveSettings();
-                  },
-                  title: const Text(
-                    'Windows açılışında arka planda başlat',
-                    style: TextStyle(
-                      color: Colors.white, // başlık rengi
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  subtitle: const Text(
-                    'Pencereyi göstermeden tray\'de dursun',
-                    style: TextStyle(
-                      color: Colors.white70, // açıklama rengi (biraz soluk beyaz)
-                    ),
-                  ),
-                  contentPadding: EdgeInsets.zero,
-                ),
+                // const SizedBox(height: 16),
+                // SwitchListTile(
+                //   value: _startHidden,
+                //   onChanged: (val) {
+                //     setState(() {
+                //       _startHidden = val;
+                //     });
+                //     _scheduleSaveSettings();
+                //   },
+                //   title: const Text(
+                //     'Windows açılışında arka planda başlat',
+                //     style: TextStyle(
+                //       color: Colors.white, // başlık rengi
+                //       fontWeight: FontWeight.bold,
+                //     ),
+                //   ),
+                //   subtitle: const Text(
+                //     'Pencereyi göstermeden tray\'de dursun',
+                //     style: TextStyle(
+                //       color: Colors.white70, // açıklama rengi (biraz soluk beyaz)
+                //     ),
+                //   ),
+                //   contentPadding: EdgeInsets.zero,
+                // ),
               ],
             ),
           ),
